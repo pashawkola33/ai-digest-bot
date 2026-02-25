@@ -9,8 +9,8 @@ import org.slf4j.LoggerFactory;
 import org.telegram.telegrambots.client.okhttp.OkHttpTelegramClient;
 import org.telegram.telegrambots.longpolling.util.LongPollingSingleThreadUpdateConsumer;
 import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
+import org.telegram.telegrambots.meta.api.methods.DeleteMessage;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
-import org.telegram.telegrambots.meta.api.methods.updatingmessages.DeleteMessage;
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
@@ -23,6 +23,7 @@ import java.time.LocalDate;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -37,6 +38,7 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
 
     private static final String CALLBACK_BEST_YEAR = "best_year:";
     private static final String CALLBACK_BEST_MONTH = "best_month:";
+    private static final String CALLBACK_BEST_BACK = "best_back";
     private static final String CALLBACK_LANG = "lang:";
 
     private static final String[] MONTH_NAMES_EN = {
@@ -81,6 +83,9 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
                 "An error occurred while generating the digest. Please try again later.");
         en.put("error.monthly_digest",
                 "An error occurred while generating the monthly digest. Please try again later.");
+        en.put("best.back", "← Back");
+        en.put("unknown.command",
+                "I am sorry, I do not recognize that command. Please use /start to see the list of available commands.");
 
         var ru = new HashMap<String, String>();
         ru.put("start.greeting",
@@ -109,6 +114,9 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
                 "Произошла ошибка при генерации дайджеста. Попробуйте позже.");
         ru.put("error.monthly_digest",
                 "Произошла ошибка при генерации месячного дайджеста. Попробуйте позже.");
+        ru.put("best.back", "← Назад");
+        ru.put("unknown.command",
+                "Извините, я не знаю такой команды. Пожалуйста, используйте /start, чтобы увидеть список доступных команд.");
 
         LOCALIZATION.put("EN", en);
         LOCALIZATION.put("RU", ru);
@@ -121,6 +129,10 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
 
     private final ScheduledExecutorService animationScheduler;
     private final ExecutorService workerExecutor;
+
+    // Tracks the messageId of the last sent "Main Menu" (greeting) per user
+    // so the old one can be deleted when /start is called again.
+    private final Map<Long, Integer> lastMenuMessageId = new ConcurrentHashMap<>();
 
     public DigestBot(String botToken, NewsFetcherService newsFetcherService,
                      GeminiService geminiService, DatabaseService databaseService) {
@@ -165,7 +177,11 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
             case "/best" -> handleBestCommand(chatId);
             case "/language" -> handleLanguageCommand(chatId);
             case "/reset" -> handleResetCommand(chatId);
-            default -> { }
+            default -> {
+                if (text.startsWith("/")) {
+                    handleUnknownCommand(chatId);
+                }
+            }
         }
     }
 
@@ -176,7 +192,7 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
 
     // --- Animation ---
 
-    private record AnimationHandle(long chatId, int messageId, ScheduledFuture<?> future) {}
+    private record AnimationHandle(long chatId, int messageId, ScheduledFuture<?> future, String baseText) {}
 
     private AnimationHandle startWaitingAnimation(long chatId, String lang) {
         var baseText = getString("wait.message", lang);
@@ -201,23 +217,24 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
                 }
             }, 1, 1, TimeUnit.SECONDS);
 
-            return new AnimationHandle(chatId, msgId, future);
+            return new AnimationHandle(chatId, msgId, future, baseText);
         } catch (TelegramApiException e) {
             logger.error("Failed to send waiting message to chat {}", chatId, e);
             return null;
         }
     }
 
-    private void stopAndDeleteAnimation(AnimationHandle handle) {
+    private void stopAnimation(AnimationHandle handle) {
         if (handle == null) return;
         handle.future().cancel(false);
         try {
-            telegramClient.execute(DeleteMessage.builder()
+            telegramClient.execute(EditMessageText.builder()
                     .chatId(handle.chatId())
                     .messageId(handle.messageId())
+                    .text(handle.baseText() + " " + DOT_FRAMES[DOT_FRAMES.length - 1])
                     .build());
         } catch (TelegramApiException e) {
-            logger.warn("Failed to delete waiting message for chat {}: {}", handle.chatId(), e.getMessage());
+            logger.warn("Failed to freeze waiting message for chat {}: {}", handle.chatId(), e.getMessage());
         }
     }
 
@@ -225,6 +242,19 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
 
     private void handleStartCommand(long chatId) {
         logger.info("Received /start command from chat {}", chatId);
+
+        // Delete the previous greeting to avoid stacking duplicate menus
+        Integer oldMenuId = lastMenuMessageId.remove(chatId);
+        if (oldMenuId != null) {
+            try {
+                telegramClient.execute(DeleteMessage.builder()
+                        .chatId(String.valueOf(chatId))
+                        .messageId(oldMenuId)
+                        .build());
+            } catch (TelegramApiException e) {
+                logger.warn("Could not delete old menu message {} for chat {}: {}", oldMenuId, chatId, e.getMessage());
+            }
+        }
 
         boolean isNewUser = !databaseService.hasLanguagePreference(chatId);
 
@@ -252,21 +282,24 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
                     .keyboardRow(row)
                     .build();
 
-            var msg = SendMessage.builder()
-                    .chatId(chatId)
-                    .text(greeting)
-                    .replyMarkup(keyboard)
-                    .build();
-
             try {
-                telegramClient.execute(msg);
+                var sent = telegramClient.execute(SendMessage.builder()
+                        .chatId(chatId)
+                        .text(greeting)
+                        .replyMarkup(keyboard)
+                        .build());
+                lastMenuMessageId.put(chatId, sent.getMessageId());
             } catch (TelegramApiException e) {
                 logger.error("Failed to send start greeting to chat {}", chatId, e);
             }
         } else {
             var lang = databaseService.getLanguage(chatId);
             try {
-                sendMessage(chatId, getString("start.greeting", lang));
+                var sent = telegramClient.execute(SendMessage.builder()
+                        .chatId(chatId)
+                        .text(getString("start.greeting", lang))
+                        .build());
+                lastMenuMessageId.put(chatId, sent.getMessageId());
             } catch (TelegramApiException e) {
                 logger.error("Failed to send start greeting to chat {}", chatId, e);
             }
@@ -363,6 +396,16 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
         }
     }
 
+    private void handleUnknownCommand(long chatId) {
+        logger.info("Received unknown command from chat {}", chatId);
+        var lang = databaseService.getLanguage(chatId);
+        try {
+            sendMessage(chatId, getString("unknown.command", lang));
+        } catch (TelegramApiException e) {
+            logger.error("Failed to send unknown command reply to chat {}", chatId, e);
+        }
+    }
+
     public void handleDigestCommand(long chatId) {
         logger.info("Received /digest command from chat {}", chatId);
 
@@ -378,13 +421,13 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
                         .toList();
 
                 if (unprocessed.isEmpty()) {
-                    stopAndDeleteAnimation(handle);
+                    stopAnimation(handle);
                     sendMessage(chatId, getString("digest.no_news", lang));
                     return;
                 }
 
                 var digest = geminiService.generateDigest(unprocessed, lang);
-                stopAndDeleteAnimation(handle);
+                stopAnimation(handle);
                 sendMessage(chatId, digest);
 
                 for (var article : unprocessed) {
@@ -394,7 +437,7 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
                 logger.info("Marked {} articles as processed for chat {}", unprocessed.size(), chatId);
 
             } catch (Exception e) {
-                stopAndDeleteAnimation(handle);
+                stopAnimation(handle);
                 logger.error("Error handling /digest command for chat {}", chatId, e);
                 try {
                     sendMessage(chatId, getString("error.digest", lang));
@@ -423,6 +466,8 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
                 handleYearSelected(chatId, messageId, data);
             } else if (data.startsWith(CALLBACK_BEST_MONTH)) {
                 handleMonthSelected(chatId, messageId, data);
+            } else if (data.equals(CALLBACK_BEST_BACK)) {
+                handleBackToYearSelection(chatId, messageId);
             } else if (data.startsWith(CALLBACK_LANG)) {
                 handleLanguageSelected(chatId, messageId, data);
             }
@@ -435,12 +480,15 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
         var lang = data.substring(CALLBACK_LANG.length());
         databaseService.setLanguage(chatId, lang);
 
-        var edit = EditMessageText.builder()
+        // Edit the current message (language picker or onboarding greeting) in-place
+        // to become the localized greeting - no new message is sent.
+        telegramClient.execute(EditMessageText.builder()
                 .chatId(chatId)
                 .messageId(messageId)
-                .text(getString("lang.changed", lang))
-                .build();
-        telegramClient.execute(edit);
+                .text(getString("start.greeting", lang))
+                .build());
+
+        lastMenuMessageId.put(chatId, messageId);
     }
 
     private void handleYearSelected(long chatId, int messageId, String data) throws TelegramApiException {
@@ -467,10 +515,18 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
             else row3.add(btn);
         }
 
+        var backRow = new InlineKeyboardRow(
+                InlineKeyboardButton.builder()
+                        .text(getString("best.back", lang))
+                        .callbackData(CALLBACK_BEST_BACK)
+                        .build()
+        );
+
         var keyboardBuilder = InlineKeyboardMarkup.builder();
         keyboardBuilder.keyboardRow(row1);
         if (!row2.isEmpty()) keyboardBuilder.keyboardRow(row2);
         if (!row3.isEmpty()) keyboardBuilder.keyboardRow(row3);
+        keyboardBuilder.keyboardRow(backRow);
 
         var edit = EditMessageText.builder()
                 .chatId(chatId)
@@ -479,6 +535,32 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
                 .replyMarkup(keyboardBuilder.build())
                 .build();
         telegramClient.execute(edit);
+    }
+
+    private void handleBackToYearSelection(long chatId, int messageId) throws TelegramApiException {
+        var lang = databaseService.getLanguage(chatId);
+
+        var row = new InlineKeyboardRow(
+                InlineKeyboardButton.builder()
+                        .text("2024")
+                        .callbackData(CALLBACK_BEST_YEAR + "2024")
+                        .build(),
+                InlineKeyboardButton.builder()
+                        .text("2025")
+                        .callbackData(CALLBACK_BEST_YEAR + "2025")
+                        .build(),
+                InlineKeyboardButton.builder()
+                        .text("2026")
+                        .callbackData(CALLBACK_BEST_YEAR + "2026")
+                        .build()
+        );
+
+        telegramClient.execute(EditMessageText.builder()
+                .chatId(chatId)
+                .messageId(messageId)
+                .text(getString("best.select_year", lang))
+                .replyMarkup(InlineKeyboardMarkup.builder().keyboardRow(row).build())
+                .build());
     }
 
     private void handleMonthSelected(long chatId, int messageId, String data) throws TelegramApiException {
@@ -510,11 +592,11 @@ public class DigestBot implements LongPollingSingleThreadUpdateConsumer {
                     digest = geminiService.generateMonthlyDigest(articles, lang);
                 }
 
-                stopAndDeleteAnimation(handle);
+                stopAnimation(handle);
                 sendMessage(chatId, digest);
 
             } catch (Exception e) {
-                stopAndDeleteAnimation(handle);
+                stopAnimation(handle);
                 logger.error("Error generating monthly digest for {}-{}", year, month, e);
                 try {
                     sendMessage(chatId, getString("error.monthly_digest", lang));
